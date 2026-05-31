@@ -18,6 +18,7 @@ import gc # Importado globalmente para garantir disponibilidade
 from app.preprocessing.utils import infer_column
 from app.config import settings
 import time # Importando time para o sleep
+from unidecode import unidecode
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -26,6 +27,15 @@ warnings.filterwarnings('ignore')
 # Cache directory
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
+
+def _normalize_city(value):
+    if pd.isnull(value):
+        return ""
+    return unidecode(str(value).strip().lower())
+
+def _filter_by_city(gdf, city_column, city_name):
+    city_norm = _normalize_city(city_name)
+    return gdf[gdf[city_column].apply(_normalize_city) == city_norm]
 
 def get_cache_key(city_name, polygon):
     """
@@ -111,8 +121,16 @@ def compute_distance_matrix(demands_gdf, ubs_gdf, city_name=None, max_distance=5
 
     if city_name:
         logger.info("Filtering demands and opportunities by city_name='%s' (case-insensitive).", city_name)
-        demands_gdf = demands_gdf[demands_gdf['NM_MUN'].str.upper() == city_name.upper()]
-        ubs_gdf = ubs_gdf[ubs_gdf['MUNICÍPIO'].str.upper() == city_name.upper()]
+        demand_city_col = infer_column(demands_gdf, settings.CITY_POSSIBLE_COLUMNS)
+        ubs_city_col = infer_column(ubs_gdf, settings.CITY_POSSIBLE_COLUMNS)
+        if demand_city_col:
+            demands_gdf = _filter_by_city(demands_gdf, demand_city_col, city_name)
+        else:
+            logger.warning("Could not infer city column for demands; skipping demand city filter.")
+        if ubs_city_col:
+            ubs_gdf = _filter_by_city(ubs_gdf, ubs_city_col, city_name)
+        else:
+            logger.warning("Could not infer city column for opportunities; skipping opportunity city filter.")
 
     # Initial buffer (in degrees) to expand if points fall outside the network.
     # Buffer reduzido para 0.02 (aprox 2.2km) para otimizar memória em áreas densas

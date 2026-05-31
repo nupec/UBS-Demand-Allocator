@@ -11,9 +11,12 @@ logger = logging.getLogger(__name__)
 # Padrão para o IP do Gateway Docker que funcionou nos testes
 VALHALLA_API_URL = os.getenv("VALHALLA_URL", "http://172.17.0.1:8002")
 
-# Limite de segurança do Valhalla (Origens x Destinos) para evitar erro 400
-# Deixamos uma pequena margem (o limite real é 2500)
-VALHALLA_MATRIX_LIMIT = 2400 
+# Limite de segurança do Valhalla (Origens x Destinos) para evitar erro 400.
+# Deixamos uma pequena margem em relação ao limite padrão de pares da matriz.
+VALHALLA_MATRIX_LIMIT = int(os.getenv("VALHALLA_MATRIX_LIMIT", "2400"))
+
+# Deve acompanhar service_limits.<costing>.max_matrix_distance no valhalla.json.
+VALHALLA_MAX_MATRIX_DISTANCE_METERS = int(os.getenv("VALHALLA_MAX_MATRIX_DISTANCE_METERS", "5000000"))
 
 def get_valhalla_matrix(
     demands_gdf, 
@@ -72,6 +75,8 @@ def get_valhalla_matrix(
 
     # 3. Inicializar a matriz numpy com NaN
     matrix_values = np.full((total_sources, total_targets), np.nan)
+    failed_batches = 0
+    failed_max_distance_batches = 0
     
     # 4. Processamento em Lotes (Batching) das ORIGENS
     for i in range(0, total_sources, batch_size):
@@ -84,7 +89,7 @@ def get_valhalla_matrix(
             "units": units,
             "costing_options": {
                 costing: {
-                    "max_distance": 5000000  # Aumenta limite de rota para 5.000 km
+                    "max_distance": VALHALLA_MAX_MATRIX_DISTANCE_METERS
                 }
             }
         }
@@ -112,9 +117,13 @@ def get_valhalla_matrix(
             else:
                 # Loga o erro mas continua o loop (as distâncias deste lote permanecerão NaN)
                 # Se todos os lotes falharem, o fallback geodésico no knn_model será ativado.
+                failed_batches += 1
+                if "max distance limit" in response.text.lower():
+                    failed_max_distance_batches += 1
                 logger.warning(f"⚠️ Lote {i} falhou (Status {response.status_code}): {response.text}")
 
         except Exception as e:
+            failed_batches += 1
             logger.error(f"❌ Erro de conexão/timeout no lote Valhalla {i}: {e}")
 
     # 5. Converter Numpy Array para Pandas DataFrame
@@ -122,5 +131,20 @@ def get_valhalla_matrix(
     opps_names = [t["id"] for t in targets]
 
     df_matrix = pd.DataFrame(matrix_values, index=demands_ids, columns=opps_names)
+    valid_distances = int(np.isfinite(matrix_values).sum())
+    if failed_batches:
+        logger.warning(
+            "Valhalla finalizado com %d lote(s) falhos e %d distância(s) válida(s).",
+            failed_batches,
+            valid_distances,
+        )
+    if valid_distances == 0 and failed_max_distance_batches:
+        logger.error(
+            "Todos os lotes falharam por limite de distância da matriz. "
+            "Verifique service_limits.%s.max_matrix_distance no valhalla.json "
+            "(valor esperado para este backend: %d metros).",
+            costing,
+            VALHALLA_MAX_MATRIX_DISTANCE_METERS,
+        )
 
     return df_matrix

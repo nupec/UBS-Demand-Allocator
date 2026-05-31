@@ -3,16 +3,19 @@ import uuid
 import os
 import pandas as pd
 import io
-import unicodedata
 import logging
 import zipfile
+import math
 
 from fastapi import APIRouter, UploadFile, File, Query, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from enum import Enum
 from app.preprocessing.common import prepare_data
 from app.methods.knn_model import allocate_demands_knn
-from app.preprocessing.utils import get_polygon_path 
+from app.preprocessing.utils import infer_column
+from app.config import settings
+from app.lib.convert_numpy import convert_numpy_types
+from unidecode import unidecode
 
 from app.analysis.reporting import (
     analyze_allocation,
@@ -27,6 +30,52 @@ from app.analysis.reporting import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+def _normalize_text(value) -> str:
+    if pd.isnull(value):
+        return ""
+    return unidecode(str(value).strip().lower())
+
+def _filter_by_normalized_column(df: pd.DataFrame, column: str, expected_value: str) -> pd.DataFrame:
+    expected_norm = _normalize_text(expected_value)
+    return df[df[column].apply(_normalize_text) == expected_norm]
+
+def _json_safe(value):
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return convert_numpy_types(value)
+
+def dataframe_to_feature_collection(df: pd.DataFrame) -> dict:
+    features = []
+    for _, row in df.iterrows():
+        lat = row.get("Origin_Lat")
+        lon = row.get("Origin_Lon")
+        geometry = None
+        if pd.notna(lat) and pd.notna(lon):
+            geometry = {
+                "type": "Point",
+                "coordinates": [float(lon), float(lat)]
+            }
+
+        properties = {
+            column: _json_safe(value)
+            for column, value in row.items()
+        }
+        features.append({
+            "type": "Feature",
+            "geometry": geometry,
+            "properties": properties
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features
+    }
 
 class MethodEnum(str, Enum):
     pandana_real_distance = "pandana_real_distance"
@@ -94,13 +143,14 @@ def allocate_demands_knn_api(
             if error:
                 logger.error("Error in prepare_data: %s", error)
                 raise HTTPException(status_code=400, detail=str(error))
-            
-            city_norm = unicodedata.normalize("NFKD", city_name.strip().lower()).encode("ascii", "ignore").decode("utf-8")
-            
-            demands_city = demands_gdf[demands_gdf["NM_MUN"].astype(str).apply(lambda x: unicodedata.normalize("NFKD", x.strip().lower()).encode("ascii", "ignore").decode("utf-8")) == city_norm]
-            
+            col_city_dem = infer_column(demands_gdf, settings.CITY_POSSIBLE_COLUMNS)
+            if not col_city_dem:
+                raise HTTPException(status_code=400, detail="Could not infer the city column in demands data.")
+
+            demands_city = _filter_by_normalized_column(demands_gdf, col_city_dem, city_name)
+
             if col_city:
-                opp_city = opportunities_gdf[opportunities_gdf[col_city].astype(str).apply(lambda x: unicodedata.normalize("NFKD", x.strip().lower()).encode("ascii", "ignore").decode("utf-8")) == city_norm]
+                opp_city = _filter_by_normalized_column(opportunities_gdf, col_city, city_name)
             else:
                 opp_city = opportunities_gdf
 
@@ -210,12 +260,17 @@ def allocate_demands_knn_api(
             return FileResponse(output_file, media_type="text/csv", filename=os.path.basename(output_file))
         elif output_format == "geojson":
             output_file = os.path.join(OUTPUT_DIR, f"allocation_result_{file_id}.geojson")
-            result_df.to_json(output_file, index=False, orient="records")
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(dataframe_to_feature_collection(result_df), f, ensure_ascii=False)
             logger.info("Returning GeoJSON file: %s", output_file)
             return FileResponse(output_file, media_type="application/geo+json", filename=os.path.basename(output_file))
         elif output_format == "json":
             logger.info("Returning JSON response directly.")
-            return JSONResponse(content=result_df.to_dict(orient="records"))
+            records = [
+                {column: _json_safe(value) for column, value in row.items()}
+                for row in result_df.to_dict(orient="records")
+            ]
+            return JSONResponse(content=records)
         else:
             logger.error("Invalid output format requested: %s", output_format)
             raise HTTPException(status_code=400, detail="Invalid output format. Use 'csv', 'geojson', or 'json'.")

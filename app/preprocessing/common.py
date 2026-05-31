@@ -9,6 +9,14 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+def _prepare_data_error(message):
+    return {"error": message}, None, None, None, None, None, None, None
+
+def _normalize_text(value):
+    if pd.isnull(value):
+        return ""
+    return unidecode(str(value).strip().lower())
+
 def prepare_data(opportunities_file, demands_file, state=None, city=None):
     logger.info("Reading GeoDataFrames from uploaded files.")
     opportunities_gdf = gpd.read_file(opportunities_file.file)
@@ -22,12 +30,17 @@ def prepare_data(opportunities_file, demands_file, state=None, city=None):
     col_demand_id = infer_column(demands_gdf, settings.DEMAND_ID_POSSIBLE_COLUMNS)
     col_name = infer_column(opportunities_gdf, settings.NAME_POSSIBLE_COLUMNS)
     col_city = infer_column(opportunities_gdf, settings.CITY_POSSIBLE_COLUMNS)
+    col_city_demand = infer_column(demands_gdf, settings.CITY_POSSIBLE_COLUMNS)
     col_state_opportunities = infer_column(opportunities_gdf, settings.STATE_POSSIBLE_COLUMNS)
     col_state_demand = infer_column(demands_gdf, settings.STATE_POSSIBLE_COLUMNS)
 
     if not col_demand_id or not col_name or not col_city or not col_state_opportunities or not col_state_demand:
         logger.error("Could not infer all necessary columns. Check the input data.")
-        return {"error": "Could not infer all necessary columns. Please check the input data."}, None, None, None, None, None
+        return _prepare_data_error("Could not infer all necessary columns. Please check the input data.")
+
+    if city and not col_city_demand:
+        logger.error("Could not infer city column in demands data.")
+        return _prepare_data_error("Could not infer the city column in demands data. Please check the input data.")
 
     if state:
         logger.info("Filtering by state='%s'.", state)
@@ -38,13 +51,10 @@ def prepare_data(opportunities_file, demands_file, state=None, city=None):
 
     if city:
         logger.info("Filtering by city='%s'.", city)
-        city = unidecode(city.lower())
-        
-        # Correção: Verifica se não é nulo antes de aplicar unidecode e lower
-        safe_format = lambda x: unidecode(str(x).lower()) if pd.notnull(x) else ""
-        
-        opportunities_gdf = opportunities_gdf[opportunities_gdf[col_city].apply(safe_format) == city]
-        demands_gdf = demands_gdf[demands_gdf['NM_MUN'].apply(safe_format) == city]
+        city_norm = _normalize_text(city)
+
+        opportunities_gdf = opportunities_gdf[opportunities_gdf[col_city].apply(_normalize_text) == city_norm]
+        demands_gdf = demands_gdf[demands_gdf[col_city_demand].apply(_normalize_text) == city_norm]
 
     logger.info("prepare_data completed successfully.")
     return None, demands_gdf, opportunities_gdf, col_demand_id, col_name, col_city, col_state_opportunities, col_state_demand
