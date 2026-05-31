@@ -4,15 +4,17 @@ import uuid
 from fastapi import APIRouter, File, UploadFile, Form, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
 
-from app.services.batch_service import BatchProcessorService, BATCH_JOBS
+from app.services.batch_service import BatchProcessorService, BATCH_JOBS, set_batch_job
 
-router = APIRouter(prefix="/api/v1/batch", tags=["Batch Processing"])
+router = APIRouter(prefix="/v1/batch", tags=["Batch Processing"])
 
 # Configurações de diretório estáticas (ajuste conforme seu servidor)
 DEMANDS_DIR = os.path.join(os.getcwd(), "data", "geojson_por_estado_cidade")
 OPPS_FILE = os.path.join(os.getcwd(), "data", "opportunities.geojson")
 UPLOADS_DIR = os.path.join(os.getcwd(), "data", "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+ALLOWED_METHODS = {"valhalla", "pysal", "pandana_real_distance"}
 
 @router.post("/start")
 async def start_batch_processing(
@@ -25,8 +27,12 @@ async def start_batch_processing(
     Inicia o processamento em lote de forma assíncrona.
     Recebe um CSV com as cidades e retorna um Job ID imediatamente.
     """
-    if not file.filename.endswith('.csv'):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="O arquivo deve ser um .csv")
+    if method not in ALLOWED_METHODS:
+        raise HTTPException(status_code=400, detail=f"Método inválido. Use: {', '.join(sorted(ALLOWED_METHODS))}.")
+    if k < 1:
+        raise HTTPException(status_code=400, detail="O parâmetro k deve ser maior ou igual a 1.")
 
     job_id = str(uuid.uuid4())
     
@@ -36,12 +42,13 @@ async def start_batch_processing(
         shutil.copyfileobj(file.file, buffer)
 
     # Inicializa o status na memória
-    BATCH_JOBS[job_id] = {
-        "status": "queued",
-        "progress": "Aguardando processamento...",
-        "result_file": None,
-        "stats": {}
-    }
+    set_batch_job(
+        job_id,
+        status="queued",
+        progress="Aguardando processamento...",
+        result_file=None,
+        stats={}
+    )
 
     # Instancia o serviço
     processor = BatchProcessorService(demands_dir=DEMANDS_DIR, opps_file_path=OPPS_FILE)
@@ -72,6 +79,8 @@ async def get_batch_status(job_id: str):
     if job_info["status"] == "completed":
         response["stats"] = job_info.get("stats", {})
         response["download_url"] = f"/api/v1/batch/download/{job_id}"
+    elif job_info["status"] == "failed":
+        response["errors"] = job_info.get("stats", {}).get("erros", [])
         
     return response
 

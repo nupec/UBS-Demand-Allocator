@@ -1,6 +1,6 @@
 import os
 import time
-import uuid
+import json
 import logging
 import pandas as pd
 from datetime import datetime
@@ -11,9 +11,39 @@ from app.methods.knn_model import allocate_demands_knn
 
 logger = logging.getLogger(__name__)
 
-# Gerenciador de estado em memória (Para produção escável, usaríamos Redis/Banco de Dados)
-# Estrutura: { "job_id": {"status": "processing|completed|failed", "progress": "...", "result_file": "...", "errors": []} }
-BATCH_JOBS = {}
+JOBS_STORE_PATH = os.getenv(
+    "BATCH_JOBS_STORE",
+    os.path.join(os.getcwd(), "data", "results", "batch_jobs.json")
+)
+
+def _load_batch_jobs():
+    try:
+        with open(JOBS_STORE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.exception("Could not load batch job store from %s", JOBS_STORE_PATH)
+        return {}
+
+def _persist_batch_jobs():
+    store_dir = os.path.dirname(JOBS_STORE_PATH)
+    if store_dir:
+        os.makedirs(store_dir, exist_ok=True)
+    tmp_path = f"{JOBS_STORE_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(BATCH_JOBS, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, JOBS_STORE_PATH)
+
+def set_batch_job(job_id: str, **updates):
+    job_info = BATCH_JOBS.setdefault(job_id, {})
+    job_info.update(updates)
+    _persist_batch_jobs()
+    return job_info
+
+# Mantem consulta imediata em memoria e persiste o estado para sobreviver a restart simples.
+BATCH_JOBS = _load_batch_jobs()
 
 class BatchProcessorService:
     def __init__(self, demands_dir: str, opps_file_path: str):
@@ -40,8 +70,7 @@ class BatchProcessorService:
     def process_batch_async(self, job_id: str, input_csv_path: str, method: str, k: int = 1):
         """Função executada em Background Task."""
         start_time = time.time()
-        BATCH_JOBS[job_id]["status"] = "processing"
-        BATCH_JOBS[job_id]["progress"] = "Iniciando leitura do CSV..."
+        set_batch_job(job_id, status="processing", progress="Iniciando leitura do CSV...")
 
         resultados_finais = []
         estatisticas = {
@@ -64,7 +93,7 @@ class BatchProcessorService:
                 municipio = str(row['MUNICIPIO']).strip()
                 
                 # Atualiza o status em tempo real para o cliente consumir
-                BATCH_JOBS[job_id]["progress"] = f"Processando [{index+1}/{total_cities}]: {municipio}/{uf}"
+                set_batch_job(job_id, progress=f"Processando [{index+1}/{total_cities}]: {municipio}/{uf}")
                 logger.info(BATCH_JOBS[job_id]["progress"])
 
                 municipio_norm = unidecode(municipio).upper().replace(" ", "_").replace("'", "")
@@ -84,22 +113,17 @@ class BatchProcessorService:
                     continue
 
                 try:
-                    # Carrega dados
                     class MockFile:
-                        def __init__(self, p): self.file = open(p, 'rb')
-                        def close(self): self.file.close()
+                        def __init__(self, file_obj):
+                            self.file = file_obj
 
-                    mf_demands = MockFile(demand_path)
-                    mf_opps = MockFile(self.opps_file_path)
-
-                    error, demands_gdf, opps_gdf, col_did, col_name, col_city, col_state_opp, _ = prepare_data(
-                        opportunities_file=mf_opps,
-                        demands_file=mf_demands,
-                        state=uf,
-                        city=municipio
-                    )
-                    mf_demands.close()
-                    mf_opps.close()
+                    with open(demand_path, "rb") as demands_f, open(self.opps_file_path, "rb") as opps_f:
+                        error, demands_gdf, opps_gdf, col_did, col_name, col_city, col_state_opp, _ = prepare_data(
+                            opportunities_file=MockFile(opps_f),
+                            demands_file=MockFile(demands_f),
+                            state=uf,
+                            city=municipio
+                        )
 
                     if error or demands_gdf.empty or opps_gdf.empty:
                         raise ValueError("Dados geográficos vazios ou corrompidos.")
@@ -140,7 +164,7 @@ class BatchProcessorService:
                     estatisticas["falhas"] += 1
 
             # Finalização e Salvação
-            BATCH_JOBS[job_id]["progress"] = "Consolidando arquivos finais..."
+            set_batch_job(job_id, progress="Consolidando arquivos finais...")
             
             if resultados_finais:
                 df_final = pd.concat(resultados_finais, ignore_index=True)
@@ -152,18 +176,25 @@ class BatchProcessorService:
                 final_path = os.path.join(output_dir, final_filename)
                 
                 df_final.to_csv(final_path, index=False)
-                BATCH_JOBS[job_id]["result_file"] = final_path
+                set_batch_job(job_id, result_file=final_path)
             else:
-                BATCH_JOBS[job_id]["result_file"] = None
+                set_batch_job(job_id, result_file=None)
 
-            BATCH_JOBS[job_id]["status"] = "completed"
-            BATCH_JOBS[job_id]["stats"] = estatisticas
-            
             duracao = round(time.time() - start_time, 2)
-            BATCH_JOBS[job_id]["progress"] = f"Finalizado em {duracao} segundos."
+            set_batch_job(
+                job_id,
+                status="completed",
+                stats=estatisticas,
+                progress=f"Finalizado em {duracao} segundos."
+            )
             logger.info(f"Job {job_id} concluído com sucesso.")
 
         except Exception as global_e:
             logger.exception(f"Erro fatal no Job {job_id}")
-            BATCH_JOBS[job_id]["status"] = "failed"
-            BATCH_JOBS[job_id]["progress"] = f"Erro fatal: {str(global_e)}"
+            set_batch_job(job_id, status="failed", progress=f"Erro fatal: {str(global_e)}")
+        finally:
+            try:
+                if os.path.exists(input_csv_path):
+                    os.remove(input_csv_path)
+            except OSError:
+                logger.warning("Could not remove temporary batch input file: %s", input_csv_path)
