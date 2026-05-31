@@ -1,4 +1,5 @@
 import logging
+import os
 from fastapi import FastAPI
 from app.config import settings
 from app.routes import router as api_router
@@ -15,14 +16,17 @@ app = FastAPI(
 )
 
 origins = [
-    "*",  
+    origin.strip()
+    for origin in os.getenv("BACKEND_CORS_ORIGINS", "http://localhost,http://127.0.0.1").split(",")
+    if origin.strip()
 ]
+allow_credentials = "*" not in origins
 
 # Middleware do CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,  
-    allow_credentials=True,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],   
     allow_headers=["*"],    
 )
